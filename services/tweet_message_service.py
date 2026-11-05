@@ -3,9 +3,12 @@
 import asyncio
 import copy
 import json
+import os
 import re
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -178,28 +181,83 @@ class TweetMessageService:
         for video in videos:
             video_url = str(video)
             try:
-                exceeds_limit, size_bytes = await self.video_exceeds_size_limit(
-                    video_url
+                component = await self.build_video_component(
+                    video_url,
+                    context_label=context_label,
                 )
-                if exceeds_limit:
-                    logger.warning(
-                        f"{context_label}视频超过大小限制，已改为链接: {video_url}"
-                    )
-                    chain.append(
-                        Comp.Plain(
-                            str(self.video_limit_message(video_url, size_bytes))
-                        )
-                    )
-                    continue
-
-                video_comp = Comp.Video.fromURL(video_url)
-                if video_comp is not None:
-                    chain.append(video_comp)
+                if component is not None:
+                    chain.append(component)
             except Exception as exc:
                 logger.warning(
                     f"添加{context_label}视频失败，回退为链接: {video_url}, {exc}"
                 )
                 chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
+
+    def _video_temp_dir(self) -> Path:
+        """插件下载视频的临时目录。"""
+        directory = Path(tempfile.gettempdir()) / "astrbot_plugin_twitter_videos"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    async def build_video_component(
+        self,
+        video_url: str,
+        context_label: str = "推文",
+    ) -> Comp.Video | Comp.Plain | None:
+        """下载视频到本地后构建 Video 组件；失败时回退为文本链接。"""
+        video_url = str(video_url or "").strip()
+        if not video_url:
+            return None
+
+        if self.is_stream_video_url(video_url):
+            logger.info(f"{context_label}视频为流媒体地址，改为发送链接: {video_url}")
+            return Comp.Plain(str(f"\n视频: {video_url}"))
+
+        exceeds_limit, size_bytes = await self.video_exceeds_size_limit(video_url)
+        if exceeds_limit:
+            logger.warning(
+                f"{context_label}视频超过大小限制，已改为链接: {video_url}"
+            )
+            return Comp.Plain(str(self.video_limit_message(video_url, size_bytes)))
+
+        limit_bytes = self.settings.video_max_size_mb * 1024 * 1024
+        try:
+            data = await self.twitter_api.download_media(
+                video_url,
+                timeout=120.0,
+                max_bytes=limit_bytes,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"下载{context_label}视频失败，回退为链接: {video_url}, {exc}"
+            )
+            if "大小限制" in str(exc):
+                return Comp.Plain(str(self.video_limit_message(video_url)))
+            return Comp.Plain(str(f"\n视频: {video_url}"))
+
+        if not data:
+            logger.warning(f"下载{context_label}视频为空，回退为链接: {video_url}")
+            return Comp.Plain(str(f"\n视频: {video_url}"))
+
+        handle, temp_path = tempfile.mkstemp(
+            prefix="twvid_",
+            suffix=".mp4",
+            dir=str(self._video_temp_dir()),
+        )
+        try:
+            with os.fdopen(handle, "wb") as file_obj:
+                file_obj.write(data)
+            logger.info(
+                f"已本地下载{context_label}视频 ({len(data)} bytes): {video_url}"
+            )
+            return Comp.Video.fromFileSystem(temp_path, url=video_url)
+        except Exception:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+            Path(temp_path).unlink(missing_ok=True)
+            raise
 
     async def build_image_component(self, img_url: str) -> Comp.Image | None:
         """根据代理配置选择合适的图片组件构建方式。"""

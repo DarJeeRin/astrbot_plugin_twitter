@@ -46,6 +46,14 @@ class Video(_Component):
     def fromURL(url):
         return Video(file=url)
 
+    @staticmethod
+    def fromFileSystem(path, **kwargs):
+        return Video(
+            file=f"file://{path}",
+            path=str(path),
+            url=kwargs.get("url", ""),
+        )
+
 
 class Node(_Component):
     def __init__(self, content, name):
@@ -191,33 +199,51 @@ async def test_both_message_modes_keep_main_media_before_quote(plugin_module, mo
         async def get_remote_file_size(self, _url):
             return 1
 
+        async def download_media(self, _url, **_kwargs):
+            return b"video"
+
     service = plugin_module.TweetMessageService(
         object(), API(), render, _message_settings(
             plugin_module, text_render_mode=mode, send_media_separately=enabled,
             pre_download_media=False,
         ),
     )
-    chain = await service.build_message_chain("tester", {
-        "text": "正文", "images": ["https://example.com/main.jpg"],
-        "videos": ["https://example.com/main.mp4"],
-        "quote": {"text": "引用", "images": ["https://example.com/quote.jpg"],
-                  "videos": ["https://example.com/quote.mp4"]},
-    })
-    media = [component.file for component in chain if isinstance(component, (Image, Video))]
-    expected = ["https://example.com/card.png"] if mode == "screenshot" else []
-    if enabled:
-        expected += ["https://example.com/main.jpg", "https://example.com/main.mp4",
-                     "https://example.com/quote.jpg", "https://example.com/quote.mp4"]
-    assert media == expected
-    if mode == "text" and enabled:
-        assert [type(component) for component in chain] == [Plain, Image, Video, Plain, Image, Video]
-        assert "正文" in chain[0].text and "引用" not in chain[0].text
-        assert "引用" in chain[3].text
-        nodes, videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
-        assert [type(node.content[0]) for node in nodes] == [Plain, Image, Plain, Image]
-        assert [video.file for video in videos] == [
-            "https://example.com/main.mp4", "https://example.com/quote.mp4",
-        ]
+    chain = []
+    try:
+        chain = await service.build_message_chain("tester", {
+            "text": "正文", "images": ["https://example.com/main.jpg"],
+            "videos": ["https://example.com/main.mp4"],
+            "quote": {"text": "引用", "images": ["https://example.com/quote.jpg"],
+                      "videos": ["https://example.com/quote.mp4"]},
+        })
+        images = [component.file for component in chain if isinstance(component, Image)]
+        videos = [component for component in chain if isinstance(component, Video)]
+        expected_images = ["https://example.com/card.png"] if mode == "screenshot" else []
+        if enabled:
+            expected_images += [
+                "https://example.com/main.jpg",
+                "https://example.com/quote.jpg",
+            ]
+        assert images == expected_images
+        if enabled:
+            assert [video.url for video in videos] == [
+                "https://example.com/main.mp4",
+                "https://example.com/quote.mp4",
+            ]
+            assert all(str(video.file).startswith("file://") for video in videos)
+        else:
+            assert videos == []
+        if mode == "text" and enabled:
+            assert [type(component) for component in chain] == [Plain, Image, Video, Plain, Image, Video]
+            assert "正文" in chain[0].text and "引用" not in chain[0].text
+            assert "引用" in chain[3].text
+            nodes, split_videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
+            assert [type(node.content[0]) for node in nodes] == [Plain, Image, Plain, Image]
+            assert [video.url for video in split_videos] == [
+                "https://example.com/main.mp4", "https://example.com/quote.mp4",
+            ]
+    finally:
+        plugin_module.TweetDeliveryService._cleanup_local_videos(chain)
 
 
 @pytest.mark.asyncio
@@ -1017,3 +1043,183 @@ async def test_failed_collective_retweet_does_not_persist_dedup(plugin_module):
     assert flushed.successful_authors == frozenset()
     assert flushed.failed_authors == frozenset({"tester"})
     assert saved_seen == []
+
+
+def _video_service(plugin_module, api, **settings):
+    return plugin_module.TweetMessageService(
+        object(),
+        api,
+        None,
+        _message_settings(
+            plugin_module,
+            text_render_mode="text",
+            pre_download_media=False,
+            proxy=None,
+            **settings,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_video_is_downloaded_then_sent_as_local_file(plugin_module):
+    downloaded = {}
+
+    class API:
+        async def get_remote_file_size(self, url):
+            assert url == "https://video.twimg.com/clip.mp4"
+            return 128
+
+        async def download_media(self, url, **kwargs):
+            downloaded["url"] = url
+            downloaded["kwargs"] = kwargs
+            return b"mp4-bytes"
+
+    service = _video_service(plugin_module, API())
+    component = await service.build_video_component("https://video.twimg.com/clip.mp4")
+    path = Path(component.path)
+    try:
+        assert isinstance(component, Video)
+        assert component.url == "https://video.twimg.com/clip.mp4"
+        assert str(component.file).startswith("file://")
+        assert downloaded["url"] == "https://video.twimg.com/clip.mp4"
+        assert downloaded["kwargs"]["timeout"] == 120.0
+        assert downloaded["kwargs"]["max_bytes"] == 256 * 1024 * 1024
+        assert path.read_bytes() == b"mp4-bytes"
+        assert "astrbot_plugin_twitter_videos" in path.parts
+
+        class Context:
+            async def send_message(self, _umo, message):
+                assert Path(message.chain[0].path).is_file()
+
+        delivery = plugin_module.TweetDeliveryService(
+            Context(), object(), object(), _delivery_settings(plugin_module),
+        )
+        assert await delivery.send_video_or_fallback("session", component) is True
+        assert not path.exists()
+    finally:
+        plugin_module.TweetDeliveryService._cleanup_local_video(component)
+
+
+@pytest.mark.asyncio
+async def test_video_send_failure_falls_back_to_remote_link(plugin_module):
+    class API:
+        async def get_remote_file_size(self, _url):
+            return 32
+
+        async def download_media(self, _url, **_kwargs):
+            return b"mp4-bytes"
+
+    component = await _video_service(plugin_module, API()).build_video_component(
+        "https://video.twimg.com/clip.mp4"
+    )
+    path = Path(component.path)
+    sent = []
+
+    class Context:
+        async def send_message(self, _umo, message):
+            sent.append(message.chain)
+            if isinstance(message.chain[0], Video):
+                raise RuntimeError("ActionFailed retcode=100 wording='fetch failed'")
+
+    delivery = plugin_module.TweetDeliveryService(
+        Context(), object(), object(), _delivery_settings(plugin_module),
+    )
+    try:
+        assert await delivery.send_video_or_fallback("session", component) is True
+    finally:
+        plugin_module.TweetDeliveryService._cleanup_local_video(component)
+
+    assert len(sent) == 2
+    assert sent[1][0].text == "视频: https://video.twimg.com/clip.mp4"
+    assert "file://" not in sent[1][0].text
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "size", "download_error", "expected"),
+    [
+        ("https://video.twimg.com/master.m3u8", None, None, "\n视频: https://video.twimg.com/master.m3u8"),
+        ("https://video.twimg.com/huge.mp4", 300 * 1024 * 1024, None, "超过 256 MB"),
+        ("https://video.twimg.com/clip.mp4", None, RuntimeError("proxy down"), "\n视频: https://video.twimg.com/clip.mp4"),
+        ("https://video.twimg.com/empty.mp4", 16, b"", "\n视频: https://video.twimg.com/empty.mp4"),
+    ],
+)
+async def test_video_download_failures_fall_back_to_text_link(
+    plugin_module, url, size, download_error, expected
+):
+    class API:
+        async def get_remote_file_size(self, _url):
+            return size
+
+        async def download_media(self, _url, **_kwargs):
+            if isinstance(download_error, Exception):
+                raise download_error
+            if download_error is None:
+                raise AssertionError("这个地址不应被下载")
+            return download_error
+
+    service = _video_service(plugin_module, API())
+    directory = service._video_temp_dir()
+    before = set(directory.iterdir())
+    component = await service.build_video_component(url)
+
+    assert isinstance(component, Plain)
+    assert expected in component.text
+    assert set(directory.iterdir()) == before
+
+
+@pytest.mark.asyncio
+async def test_node_fallback_drops_local_video_file_and_keeps_remote_link(plugin_module):
+    class API:
+        async def get_remote_file_size(self, _url):
+            return 32
+
+        async def download_media(self, _url, **_kwargs):
+            return b"mp4-bytes"
+
+    component = await _video_service(plugin_module, API()).build_video_component(
+        "https://video.twimg.com/clip.mp4"
+    )
+    path = Path(component.path)
+    sent = []
+
+    class Context:
+        async def send_message(self, _umo, message):
+            sent.append(list(message.chain))
+            if any(isinstance(part, Nodes) for part in message.chain):
+                raise RuntimeError("node failed")
+
+    async def build_message_chain(*_args, **_kwargs):
+        return [Plain("body"), component]
+
+    delivery = plugin_module.TweetDeliveryService(
+        Context(),
+        object(),
+        types.SimpleNamespace(build_message_chain=build_message_chain),
+        _delivery_settings(plugin_module, use_node=True),
+    )
+    try:
+        assert await delivery.send_to_subscriber("session", "user", {}, {}, "User") is True
+    finally:
+        plugin_module.TweetDeliveryService._cleanup_local_video(component)
+
+    texts = [
+        part.text
+        for call in sent
+        for part in call
+        if isinstance(part, Plain)
+    ]
+    assert any("https://video.twimg.com/clip.mp4" in text for text in texts)
+    assert all("file://" not in text for text in texts)
+    assert not path.exists()
+
+
+def test_local_video_cleanup_ignores_files_outside_plugin_temp_dir(plugin_module, tmp_path):
+    path = tmp_path / "keep.mp4"
+    path.write_bytes(b"keep")
+    video = Video(file=path.as_uri(), path=str(path), url="https://video.twimg.com/keep.mp4")
+
+    plugin_module.TweetDeliveryService._cleanup_local_video(video)
+
+    assert path.read_bytes() == b"keep"

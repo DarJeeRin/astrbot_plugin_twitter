@@ -48,6 +48,14 @@ class Video(_Component):
     def fromURL(url):
         return Video(file=url)
 
+    @staticmethod
+    def fromFileSystem(path, **kwargs):
+        return Video(
+            file=f"file://{path}",
+            path=str(path),
+            url=kwargs.get("url", ""),
+        )
+
 
 class Node(_Component):
     pass
@@ -577,6 +585,7 @@ async def test_fxtwitter_initialization_skips_nitter(plugin_module):
     fake = FakeTwitterAPI.instances[-1]
     assert fake.fx_checks == 1
     assert fake.nitter_checks == 0
+    assert fake.kwargs["video_max_size_mb"] == plugin.video_max_size_mb
     assert plugin._provider_ready is True
     assert plugin._poll_task is not None
 
@@ -1405,6 +1414,10 @@ async def test_test_command_and_link_recognition_share_prepared_delivery(
             )
 
         async def send_prepared_videos(self, _umo, _videos):
+            return None
+
+        @staticmethod
+        def _cleanup_local_videos(_components):
             return None
 
     class Event:
