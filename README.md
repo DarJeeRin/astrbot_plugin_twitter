@@ -140,7 +140,7 @@
 | `twitter_screenshot_theme` | `dark` | 截图使用 `dark` 或 `light` 主题 |
 | `twitter_send_media_separately` | `true` | 正文或截图之外继续发送原图、视频及视频降级链接 |
 | `twitter_image_quality` | `orig` | `large` 缩略图，或 `orig` 原图 |
-| `twitter_video_max_size_mb` | `256` | 视频直发大小上限，超过后发送链接 |
+| `twitter_video_max_size_mb` | `256` | 插件下载视频后以本地文件发送。多种 MP4 时选择未超过上限的最高码率，大小未知时偏向约 720p；超过上限或失败时发送链接 |
 | `twitter_collective_forward` | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node` |
 | `twitter_collective_max_authors` | `5` | 单条集体转发消息中的最多推主数 |
 | `twitter_include_tweet_link` | `true` | 在推送、测试和解析消息末尾附带帖子链接 |

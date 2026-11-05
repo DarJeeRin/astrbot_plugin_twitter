@@ -516,3 +516,93 @@ async def test_nitter_translation_does_not_request(api_module):
 
     api._request_fxtwitter_json = request
     assert await api.get_tweet_translation("tester", "1005", "zh") is None
+
+
+def _mp4(url, bitrate=0, width=0, height=0):
+    item = {"container": "mp4", "url": url}
+    if bitrate:
+        item["bitrate"] = bitrate
+    if width:
+        item["width"] = width
+    if height:
+        item["height"] = height
+    return item
+
+
+def test_video_format_selection_prefers_fitting_bitrate_or_720p(api_module):
+    tight = api_module.TwitterAPI(provider="fxtwitter", video_max_size_mb=1)
+    roomy = api_module.TwitterAPI(provider="fxtwitter", video_max_size_mb=256)
+    formats = [
+        _mp4("https://video.twimg.com/4k.mp4", bitrate=8_000_000, width=3840, height=2160),
+        _mp4("https://video.twimg.com/720.mp4", bitrate=1_000_000, width=1280, height=720),
+        _mp4("https://video.twimg.com/480.mp4", bitrate=2_000_000, width=854, height=480),
+    ]
+
+    # 8 秒 * 1 Mbps / 8 = 1_000_000 字节，低于 1 MiB；4K 超限。
+    assert tight._select_fxtwitter_video_url({"duration": 8, "formats": formats}) == (
+        "https://video.twimg.com/720.mp4"
+    )
+    # 上限足够时仍选最高码率，而不是固定 720p。
+    assert roomy._select_fxtwitter_video_url({"duration": 1, "formats": formats[:2]}) == (
+        "https://video.twimg.com/4k.mp4"
+    )
+    # 无法估算大小时偏向约 720p，即使更低清晰度的码率更高。
+    assert roomy._select_fxtwitter_video_url({"formats": formats}) == (
+        "https://video.twimg.com/720.mp4"
+    )
+    assert roomy._select_fxtwitter_video_url({
+        "formats": [
+            formats[0],
+            _mp4("https://video.twimg.com/1080.mp4", bitrate=2_000_000, width=1920, height=1080),
+        ],
+    }) == "https://video.twimg.com/1080.mp4"
+    assert roomy._select_fxtwitter_video_url({
+        "formats": [
+            _mp4("https://video.twimg.com/vertical.mp4", bitrate=1_000_000, width=720, height=1280),
+            _mp4("https://video.twimg.com/tall-4k.mp4", bitrate=9_000_000, width=2160, height=3840),
+        ],
+    }) == "https://video.twimg.com/vertical.mp4"
+    assert roomy._select_fxtwitter_video_url({
+        "formats": [
+            {
+                "container": "mp4",
+                "bitrate": 9_000_000,
+                "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/3840x2160/b.mp4",
+            },
+            {
+                "container": "mp4",
+                "bitrate": 1_000_000,
+                "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1280x720/a.mp4",
+            },
+        ],
+    }).endswith("/1280x720/a.mp4")
+    assert roomy._select_fxtwitter_video_url({
+        "formats": [
+            _mp4("https://video.twimg.com/low.mp4", bitrate=100),
+            _mp4("https://video.twimg.com/high.mp4", bitrate=200),
+        ],
+    }) == "https://video.twimg.com/high.mp4"
+    assert tight._select_fxtwitter_video_url({
+        "duration": 8,
+        "formats": [
+            _mp4("https://video.twimg.com/big.mp4", bitrate=8_000_000, width=1920, height=1080),
+            _mp4("https://video.twimg.com/bigger.mp4", bitrate=16_000_000, width=3840, height=2160),
+        ],
+    }) == "https://video.twimg.com/big.mp4"
+    assert roomy._select_fxtwitter_video_url({
+        "url": "https://video.twimg.com/only.m3u8",
+        "formats": [{"container": "m3u8", "url": "https://video.twimg.com/only.m3u8"}],
+    }) == "https://video.twimg.com/only.m3u8"
+    assert roomy._select_fxtwitter_video_url({
+        "duration": 8,
+        "formats": [
+            {
+                "container": "mp4",
+                "url": "https://video.twimg.com/from-bit-rate.mp4",
+                "bit_rate": 1_000_000,
+                "width": 1280,
+                "height": 720,
+            },
+            _mp4("https://video.twimg.com/tiny.mp4", bitrate=100, width=320, height=180),
+        ],
+    }) == "https://video.twimg.com/from-bit-rate.mp4"

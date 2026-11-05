@@ -1,9 +1,10 @@
 """推文消息的拆分、发送、降级和集体转发服务。"""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -146,22 +147,54 @@ class TweetDeliveryService:
 
     @staticmethod
     def build_plain_chain(chain: list) -> list:
-        """保留图片，并把视频转换为链接文本。"""
+        """保留图片，把视频转换为远程链接，并删除已下载的临时视频。"""
         plain_chain = TweetMessageChain(required_images=getattr(chain, "required_images", ()))
         for component in chain:
             if isinstance(component, Comp.Video):
-                video_url = getattr(component, "file", "") or getattr(
-                    component,
-                    "url",
-                    "",
-                )
+                video_url = TweetDeliveryService._video_fallback_url(component)
                 if video_url:
                     plain_chain.append(
                         Comp.Plain(str(f"\n视频: {video_url}"))
                     )
+                TweetDeliveryService._cleanup_local_video(component)
             else:
                 plain_chain.append(component)
         return plain_chain
+
+    @staticmethod
+    def _video_fallback_url(video_component: Comp.Video) -> str:
+        """优先使用原始远程 URL，避免把本地 file:// 路径发给用户。"""
+        for candidate in (
+            getattr(video_component, "url", ""),
+            getattr(video_component, "file", ""),
+        ):
+            text = str(candidate or "").strip()
+            if text.startswith(("http://", "https://")):
+                return text
+        return ""
+
+    @staticmethod
+    def _cleanup_local_video(video_component: Comp.Video) -> None:
+        """发送结束或放弃发送后，清理插件下载的临时视频文件。"""
+        local_path = str(getattr(video_component, "path", "") or "").strip()
+        if not local_path:
+            return
+        try:
+            path = Path(local_path)
+        except (TypeError, ValueError):
+            return
+        try:
+            if "astrbot_plugin_twitter_videos" not in path.parts:
+                return
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug(f"清理临时视频失败: {local_path}, {exc}")
+
+    @staticmethod
+    def _cleanup_local_videos(components: Iterable | None) -> None:
+        for component in components or []:
+            if isinstance(component, Comp.Video):
+                TweetDeliveryService._cleanup_local_video(component)
 
     @staticmethod
     def split_plain_chain_and_videos(
@@ -315,11 +348,7 @@ class TweetDeliveryService:
             return True
         except Exception as exc:
             logger.warning(f"视频发送失败，回退为链接: {exc}")
-            video_url = getattr(video_component, "file", "") or getattr(
-                video_component,
-                "url",
-                "",
-            )
+            video_url = self._video_fallback_url(video_component)
             if video_url:
                 try:
                     await self._send_message_checked(
@@ -334,6 +363,8 @@ class TweetDeliveryService:
                         f"视频与降级链接均发送失败: {fallback_exc}"
                     )
             return False
+        finally:
+            self._cleanup_local_video(video_component)
 
     async def send_prepared_videos(
         self,
@@ -341,12 +372,15 @@ class TweetDeliveryService:
         videos: list[Comp.Video],
     ) -> bool:
         """逐条发送准备结果中的独立视频。"""
-        results: list[bool] = []
-        for video_component in videos:
-            results.append(
-                await self.send_video_or_fallback(umo, video_component)
-            )
-        return all(results)
+        try:
+            results: list[bool] = []
+            for video_component in videos:
+                results.append(
+                    await self.send_video_or_fallback(umo, video_component)
+                )
+            return all(results)
+        finally:
+            self._cleanup_local_videos(videos)
 
     async def push_to_subscribers(
         self,
@@ -599,6 +633,7 @@ class TweetDeliveryService:
         主要内容发送成功后追加，附加媒体中断不丢弃正文回执。
         """
         receipt_recorded = False
+        chain = None
 
         def record_sent() -> None:
             nonlocal receipt_recorded
@@ -674,6 +709,8 @@ class TweetDeliveryService:
         except Exception as exc:
             logger.error(f"推送推文至 {umo} 失败: {exc}")
             return False
+        finally:
+            self._cleanup_local_videos(chain)
 
     async def flush_collected(
         self, *, pending_tweet_items: dict[str, list[dict]] | None = None,
@@ -711,6 +748,7 @@ class TweetDeliveryService:
         retweet_seen = await self.subscriptions.get_retweet_seen()
         retweet_seen_dirty = False
         retweet_seen_authors: set[str] = set()
+        pending_local_videos: list[Comp.Video] = []
 
         def record_result(
             umo: str,
@@ -797,6 +835,7 @@ class TweetDeliveryService:
                     nodes: list[Node] = []
 
                     for cached_tweet in batch_tweets:
+                        chain = None
                         try:
                             chain = await self.messages.build_message_chain(
                                 cached_tweet.username,
@@ -817,8 +856,11 @@ class TweetDeliveryService:
                             prepared.append(
                                 (cached_tweet, tweet_nodes, tweet_videos)
                             )
+                            pending_local_videos.extend(tweet_videos)
                             nodes.extend(tweet_nodes)
+                            chain = None
                         except Exception as exc:
+                            self._cleanup_local_videos(chain)
                             logger.error(
                                 "构建集体转发推文失败: "
                                 f"{umo} -> @{cached_tweet.username}, {exc}"
@@ -848,6 +890,8 @@ class TweetDeliveryService:
                             )
 
                     if nodes and not nodes_sent:
+                        for _cached_tweet, _tweet_nodes, tweet_videos in prepared:
+                            self._cleanup_local_videos(tweet_videos)
                         for cached_tweet, _tweet_nodes, _tweet_videos in prepared:
                             sent = await self.send_to_subscriber(
                                 umo,
@@ -898,6 +942,7 @@ class TweetDeliveryService:
                     for username in retweet_seen_authors:
                         author_success[username] = False
         finally:
+            self._cleanup_local_videos(pending_local_videos)
             self._pending_retweet_seen.clear()
 
         successful_authors = frozenset(

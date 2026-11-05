@@ -78,10 +78,16 @@ class TwitterAPI:
         fxtwitter_api_base: str = DEFAULT_FXTWITTER_API_BASE,
         fxtwitter_max_pages: int = FXTWITTER_MAX_TIMELINE_PAGES,
         fxtwitter_max_items: int = FXTWITTER_MAX_TIMELINE_ITEMS,
+        video_max_size_mb: int = 256,
     ):
         self.proxy = proxy
         self.nitter_url = nitter_url
         self.image_quality = image_quality if image_quality in IMAGE_QUALITY_OPTIONS else "orig"
+        try:
+            configured_video_limit = int(video_max_size_mb or 256)
+        except (TypeError, ValueError):
+            configured_video_limit = 256
+        self.video_max_size_mb = max(1, configured_video_limit)
         provider = str(provider or DATA_PROVIDER_NITTER).strip().lower()
         self.provider = (
             provider if provider in DATA_PROVIDER_OPTIONS else DATA_PROVIDER_NITTER
@@ -1075,8 +1081,57 @@ class TwitterAPI:
         return result
 
     @staticmethod
-    def _select_fxtwitter_video_url(video: dict) -> str:
-        """优先选择最高码率 MP4，再回退到媒体 URL、转码或流媒体。"""
+    def _as_positive_int(value: Any) -> int:
+        """把码率或分辨率读成正整数；无效值视为未知。"""
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return number if number > 0 else 0
+
+    @staticmethod
+    def _video_format_dimensions(item: dict) -> tuple[int, int]:
+        """读取宽高；字段缺失时从 URL 路径中的 WxH 片段解析。"""
+        width = TwitterAPI._as_positive_int(item.get("width"))
+        height = TwitterAPI._as_positive_int(item.get("height"))
+        if width and height:
+            return width, height
+        url = str(item.get("url") or "")
+        match = re.search(r"(?:/|_)(\d{2,5})x(\d{2,5})(?:/|\.|_)", url)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return width, height
+
+    @staticmethod
+    def _video_format_short_side(item: dict) -> int:
+        """用短边近似清晰度，使竖屏 720x1280 也算约 720p。"""
+        width, height = TwitterAPI._video_format_dimensions(item)
+        if width and height:
+            return min(width, height)
+        return width or height
+
+    @staticmethod
+    def _video_format_bitrate(item: dict) -> int:
+        return TwitterAPI._as_positive_int(
+            item.get("bitrate") or item.get("bit_rate")
+        )
+
+    @staticmethod
+    def _estimate_video_format_size(item: dict, duration: float) -> int | None:
+        """用码率与时长估算字节数；信息不足时返回 None。"""
+        bitrate = TwitterAPI._video_format_bitrate(item)
+        if bitrate <= 0 or duration <= 0:
+            return None
+        return int(bitrate * duration / 8)
+
+    @staticmethod
+    def _video_format_quality_key(item: dict) -> tuple[int, int]:
+        width, height = TwitterAPI._video_format_dimensions(item)
+        area = width * height if width and height else 0
+        return (TwitterAPI._video_format_bitrate(item), area)
+
+    def _select_fxtwitter_video_url(self, video: dict) -> str:
+        """优先选择未超大小上限的最高码率 MP4；大小未知时偏向约 720p。"""
         formats = video.get("formats") or []
         mp4_formats = [
             item
@@ -1089,14 +1144,65 @@ class TwitterAPI:
             )
         ]
         if mp4_formats:
-            best = max(
-                mp4_formats,
-                key=lambda item: (
-                    int(item.get("bitrate") or 0),
-                    int(item.get("width") or 0) * int(item.get("height") or 0),
-                ),
-            )
-            return str(best.get("url") or "")
+            try:
+                duration = float(video.get("duration") or 0)
+            except (TypeError, ValueError):
+                duration = 0.0
+            if duration < 0:
+                duration = 0.0
+            max_bytes = self.video_max_size_mb * 1024 * 1024
+            estimated: list[tuple[int, dict]] = []
+            unknown: list[dict] = []
+            for item in mp4_formats:
+                size = self._estimate_video_format_size(item, duration)
+                if size is None:
+                    unknown.append(item)
+                else:
+                    estimated.append((size, item))
+
+            under_cap = [item for size, item in estimated if size <= max_bytes]
+            if under_cap:
+                best = max(under_cap, key=self._video_format_quality_key)
+                return str(best.get("url") or "")
+
+            around_720 = [
+                item
+                for item in unknown
+                if 0 < self._video_format_short_side(item) <= 720
+            ]
+            if around_720:
+                best = max(
+                    around_720,
+                    key=lambda item: (
+                        -abs(self._video_format_short_side(item) - 720),
+                        self._video_format_quality_key(item),
+                    ),
+                )
+                return str(best.get("url") or "")
+
+            larger_known = [
+                item
+                for item in unknown
+                if self._video_format_short_side(item) > 720
+            ]
+            if larger_known:
+                best = min(
+                    larger_known,
+                    key=lambda item: (
+                        self._video_format_short_side(item),
+                        -self._video_format_bitrate(item),
+                    ),
+                )
+                return str(best.get("url") or "")
+
+            if unknown:
+                best = max(unknown, key=self._video_format_quality_key)
+                return str(best.get("url") or "")
+
+            if estimated:
+                # 全部估算都超限时选最小的，后续大小检查再降级为链接。
+                best = min(estimated, key=lambda pair: pair[0])[1]
+                return str(best.get("url") or "")
 
         for key in ("url", "transcode_url"):
             candidate = str(video.get(key) or "").strip()

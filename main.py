@@ -354,6 +354,7 @@ class TwitterPlugin(Star):
             image_quality=self.image_quality,
             provider=self.data_provider,
             fxtwitter_api_base=self.fxtwitter_api_base,
+            video_max_size_mb=self.video_max_size_mb,
         )
         self._provider_ready = False
 
@@ -1015,26 +1016,29 @@ class TwitterPlugin(Star):
             yield event.plain_result(f"未找到 @{username} 的推文内容")
             return
 
-        author_username = str(tweet_info.get("username") or username)
-        screen_name = str(
-            tweet_info.get("screen_name") or author_username
-        )
-        nickname = self.message_service.build_author_display(
-            author_username,
-            screen_name,
-        )
-        prepared = self.delivery_service.prepare_event_delivery(
-            chain,
-            nickname,
-        )
-        if prepared.primary_chain:
-            yield event.chain_result(prepared.primary_chain)
-        else:
-            yield event.plain_result(f"未找到 @{username} 的推文内容")
-        await self.delivery_service.send_prepared_videos(
-            umo,
-            prepared.videos,
-        )
+        try:
+            author_username = str(tweet_info.get("username") or username)
+            screen_name = str(
+                tweet_info.get("screen_name") or author_username
+            )
+            nickname = self.message_service.build_author_display(
+                author_username,
+                screen_name,
+            )
+            prepared = self.delivery_service.prepare_event_delivery(
+                chain,
+                nickname,
+            )
+            if prepared.primary_chain:
+                yield event.chain_result(prepared.primary_chain)
+            else:
+                yield event.plain_result(f"未找到 @{username} 的推文内容")
+            await self.delivery_service.send_prepared_videos(
+                umo,
+                prepared.videos,
+            )
+        finally:
+            self.delivery_service._cleanup_local_videos(chain)
 
     async def _handle_tweet_link(
         self,
@@ -1049,6 +1053,7 @@ class TwitterPlugin(Star):
         username = match.group(2)
         tweet_id = match.group(3)
         logger.info(f"检测到推文链接: {link}")
+        chain = None
 
         try:
             tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
@@ -1097,6 +1102,8 @@ class TwitterPlugin(Star):
             logger.error(f"解析推文链接失败: {exc}")
             if report_errors:
                 yield event.plain_result("解析推文链接失败，请稍后重试")
+        finally:
+            self.delivery_service._cleanup_local_videos(chain)
 
     @filter.command("推特解析", alias={"twitter_parse"})
     async def parse_tweet_link(self, event: AstrMessageEvent):
