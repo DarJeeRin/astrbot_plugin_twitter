@@ -1152,6 +1152,40 @@ async def test_commands_report_timeline_failures_clearly(plugin_module):
 
 
 @pytest.mark.asyncio
+async def test_batch_follow_failure_does_not_echo_request_secrets(plugin_module):
+    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin._provider_ready = True
+    secret = "https://api.example.com/v1 api_key=sk-test-secret"
+
+    class API:
+        async def get_user_info(self, _username):
+            raise ConnectionError(secret)
+
+    class Event:
+        message_str = "/推特批量关注 tester"
+        unified_msg_origin = "session"
+
+        @staticmethod
+        def plain_result(text):
+            return text
+
+    plugin.twitter_api = API()
+    plugin.subscription_service = types.SimpleNamespace()
+
+    async def add_subscription(*_args, **_kwargs):
+        raise ConnectionError(secret)
+
+    plugin._add_subscription = add_subscription
+    results = [
+        result
+        async for result in plugin.batch_follow_twitter(Event())
+    ]
+    assert secret not in "\n".join(results)
+    assert "api_key" not in "\n".join(results)
+    assert any("订阅失败，请稍后重试" in result for result in results)
+
+
+@pytest.mark.asyncio
 async def test_existing_author_subscription_reuses_cursor_without_api_calls(
     plugin_module,
 ):
@@ -2984,3 +3018,16 @@ def test_translation_method_config_compatibility(plugin_module, config, method, 
     plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(), config)
     assert plugin.message_service.settings.translate_method == method
     assert plugin.message_service.settings.translate_native_lang == lang
+    assert plugin.message_service.settings.show_translate_source is False
+
+
+@pytest.mark.parametrize("config, enabled", [
+    ({}, False),
+    ({"twitter_translate_show_source": True}, True),
+    ({"translation": {"twitter_translate_show_source": False}}, False),
+    ({"translation": {"twitter_translate_show_source": True}}, True),
+])
+def test_translate_source_config_defaults_off_and_reads_old_layout(plugin_module, config, enabled):
+    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(), config)
+    assert plugin.show_translate_source is enabled
+    assert plugin.message_service.settings.show_translate_source is enabled

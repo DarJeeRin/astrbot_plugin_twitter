@@ -161,6 +161,12 @@
         "default": false,
         "hint": "开启后，推文正文将被翻译为目标语言"
       },
+      "twitter_translate_show_source": {
+        "description": "在发送的消息中附带翻译来源",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，普通消息、合并转发和截图会标注翻译所用的服务、提供商或模型，例如“由 gpt-4o 翻译自原文”。关闭后仍发送译文，只去掉这类来源标注。默认关闭，避免把翻译 API 信息发到聊天。"
+      },
       "twitter_translate_method": {
         "description": "翻译方式",
         "type": "string",

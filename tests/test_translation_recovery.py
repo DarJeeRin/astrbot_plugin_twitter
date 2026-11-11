@@ -423,3 +423,211 @@ async def test_native_translation_timeout_keeps_original(plugin_module):
     assert await service.maybe_translate({"text": "original"}, "session") == (None, None)
     assert cancelled == [True]
     assert context.calls == []
+
+
+SOURCE_MODEL = "https://api.example.com/v1"
+SOURCE_KEY = "sk-test-secret"
+SOURCE_NOTE = f"（由 {SOURCE_MODEL} 翻译自原文）"
+
+
+def _walk_text(component) -> str:
+    parts: list[str] = []
+
+    def walk(item) -> None:
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+        children = (
+            getattr(item, "chain", None)
+            or getattr(item, "nodes", None)
+            or getattr(item, "content", None)
+            or []
+        )
+        if isinstance(children, (list, tuple)):
+            for child in children:
+                walk(child)
+
+    walk(component)
+    return "\n".join(parts)
+
+
+def _source_tweet() -> dict:
+    return {
+        "username": "author",
+        "screen_name": "Author",
+        "tweet_id": "9",
+        "text": "original body",
+        "quote": {
+            "username": "quoted",
+            "author": "Quoted",
+            "text": "original quote",
+            "translated_text": "引用译文",
+        },
+    }
+
+
+class Subscriptions:
+    def __init__(self):
+        self.subs = {
+            "author": {
+                "screen_name": "Author",
+                "subscribers": {"session": {"status": True}},
+            }
+        }
+
+    async def get_all(self):
+        return self.subs
+
+    async def get_retweet_seen(self):
+        return {}
+
+    def mark_retweet_seen(self, *_args):
+        return None
+
+    async def save_retweet_seen(self, _seen):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("show_source", [False, True])
+@pytest.mark.parametrize("surface", ["text", "screenshot", "fallback", "node", "collective"])
+@pytest.mark.parametrize("quote_only", [False, True])
+async def test_translate_source_switch_covers_every_outgoing_surface(
+    plugin_module, show_source, surface, quote_only
+):
+    contexts = []
+
+    async def html_render(_template, context, **_kwargs):
+        contexts.append(copy.deepcopy(context))
+        if surface == "fallback":
+            raise RuntimeError(f"render {SOURCE_MODEL} key={SOURCE_KEY}")
+        return "https://example.com/card.png"
+
+    service = make_service(
+        plugin_module,
+        Context(),
+        text_render_mode="text" if surface in ("text", "node", "collective") else "screenshot",
+        show_translate_source=show_source,
+        include_tweet_link=True,
+        pre_download_media=False,
+        proxy=None,
+    )
+    service.html_render = html_render
+    translated_text = None if quote_only else "正文译文"
+    tweet = _source_tweet()
+    sent = []
+
+    async def send_message(_umo, message):
+        sent.append(message)
+        return True
+
+    if surface in ("text", "screenshot", "fallback"):
+        chain = await service.build_message_chain(
+            "author",
+            tweet,
+            translated_text=translated_text,
+            translate_model=SOURCE_MODEL,
+        )
+        outgoing = _walk_text(types.SimpleNamespace(chain=chain))
+    else:
+        delivery = plugin_module.TweetDeliveryService(
+            types.SimpleNamespace(send_message=send_message),
+            Subscriptions(),
+            service,
+            _delivery_settings(
+                plugin_module,
+                use_node=True,
+                collective_forward=surface == "collective",
+            ),
+        )
+        if surface == "node":
+            await delivery.send_to_subscriber(
+                "session",
+                "author",
+                tweet,
+                {"status": True},
+                "@author",
+                translated_text=translated_text,
+                translate_model=SOURCE_MODEL,
+                recent_deliveries=[],
+            )
+        else:
+            cached = sys.modules[
+                f"{plugin_module.__package__}.services.tweet_delivery_service"
+            ].CachedTweet(
+                username="author",
+                tweet_info=tweet,
+                sub_config={"status": True},
+                nickname="@author",
+                translated_text=translated_text,
+                translate_model=SOURCE_MODEL,
+            )
+            delivery._collected_tweets = {"session": [cached]}
+            await delivery.flush_collected()
+        outgoing = "\n".join(_walk_text(message) for message in sent)
+
+    rendered_parts: list[str] = []
+    for item in contexts:
+        card = item.get("tweet") or {}
+        rendered_parts.append(str(card.get("text") or ""))
+        rendered_parts.append(str((card.get("quote") or {}).get("text") or ""))
+        rendered_parts.append(str(card.get("translation_note") or ""))
+    visible = "\n".join([outgoing, *rendered_parts])
+    assert "引用译文" in visible
+    if quote_only:
+        assert "original body" in visible
+    else:
+        assert "正文译文" in visible
+    assert SOURCE_KEY not in visible
+    if show_source:
+        assert SOURCE_MODEL in visible
+        assert "翻译自原文" in visible
+    else:
+        assert SOURCE_MODEL not in visible
+        assert "翻译自原文" not in visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("show_source", [False, True])
+async def test_translation_failure_does_not_send_api_address_or_key(
+    plugin_module, monkeypatch, show_source
+):
+    context = Context()
+
+    async def fail(**_kwargs):
+        raise ConnectionError(
+            f"POST {SOURCE_MODEL} unauthorized api_key={SOURCE_KEY}"
+        )
+
+    async def no_delay(_seconds):
+        return None
+
+    context.llm_generate = fail
+    message_module = sys.modules[
+        f"{plugin_module.__package__}.services.tweet_message_service"
+    ]
+    monkeypatch.setattr(message_module.asyncio, "sleep", no_delay)
+    service = make_service(
+        plugin_module,
+        context,
+        text_render_mode="text",
+        show_translate_source=show_source,
+        pre_download_media=False,
+        proxy=None,
+    )
+    tweet = {"text": "original body", "quote": {"text": "original quote"}}
+    translated, model = await service.maybe_translate(tweet, "session")
+    chain = await service.build_message_chain(
+        "author",
+        tweet,
+        translated_text=translated,
+        translate_model=model,
+    )
+    visible = _walk_text(types.SimpleNamespace(chain=chain))
+    assert "original body" in visible
+    assert "original quote" in visible
+    assert model is None
+    assert SOURCE_MODEL not in visible
+    assert SOURCE_KEY not in visible
+    assert "api_key" not in visible
+    assert "翻译自原文" not in visible

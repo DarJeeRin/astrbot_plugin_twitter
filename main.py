@@ -327,6 +327,13 @@ class TwitterPlugin(Star):
             )
             or ""
         ).strip()
+        self.show_translate_source = bool(
+            self._cfg(
+                "translation",
+                "twitter_translate_show_source",
+                False,
+            )
+        )
         self.custom_nitter_url = str(
             self._cfg("basic", "twitter_nitter_url", "") or ""
         ).strip()
@@ -390,6 +397,7 @@ class TwitterPlugin(Star):
                     self.translate_custom_prompt_enabled
                 ),
                 translate_custom_prompt=self.translate_custom_prompt,
+                show_translate_source=self.show_translate_source,
                 pre_download_media=self.pre_download_media,
                 proxy=self.proxy,
             ),
@@ -790,7 +798,10 @@ class TwitterPlugin(Star):
                 )
                 results.append(f"❌ @{username} - 获取时间线失败")
             except Exception as exc:
-                results.append(f"❌ @{username} - 订阅失败: {exc}")
+                logger.warning(
+                    f"批量订阅 @{username} 失败: {type(exc).__name__}"
+                )
+                results.append(f"❌ @{username} - 订阅失败，请稍后重试")
 
         yield event.plain_result(
             f"批量订阅完成: 成功 {success_count}/{len(usernames)}\n"
