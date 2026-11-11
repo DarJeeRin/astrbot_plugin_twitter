@@ -730,6 +730,7 @@ async def test_text_layout_keeps_retweet_quote_and_translation_paragraphs(
             include_tweet_link=True,
             pre_download_media=False,
             proxy=None,
+            show_translate_source=True,
         ),
     )
     tweet_info = {

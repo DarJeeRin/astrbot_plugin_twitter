@@ -55,6 +55,7 @@ class TweetMessageSettings:
     translate_timeout_seconds: int = 60
     translate_method: str = "llm"
     translate_native_lang: str = "zh"
+    show_translate_source: bool = False
 
 
 @dataclass(slots=True)
@@ -530,6 +531,13 @@ class TweetMessageService:
         logger.warning("翻译全部重试失败，使用原文")
         return text, None
 
+    def _visible_translate_model(self, translate_model: str | None) -> str | None:
+        """关闭来源标注时不把 Provider、模型或服务名写入待发送内容。"""
+        if not self.settings.show_translate_source:
+            return None
+        model = str(translate_model or "").strip()
+        return model or None
+
     def _display_text(self, tweet: dict, translated_text: str | None = None) -> str:
         article = tweet.get("article")
         if article and (translated_text is None or tweet.get("translated_article")):
@@ -553,6 +561,7 @@ class TweetMessageService:
         if sub_config is None:
             sub_config = {"r18": True, "media": False, "status": True}
 
+        translate_model = self._visible_translate_model(translate_model)
         text = self._display_text(tweet_info, translated_text)
         quote = tweet_info.get("quote")
         tweet_id = str(tweet_info.get("tweet_id") or "")
@@ -715,7 +724,7 @@ class TweetMessageService:
                 username,
                 render_tweet_info,
                 translated_text=translated_text,
-                translate_model=translate_model,
+                translate_model=self._visible_translate_model(translate_model),
                 theme=self.settings.screenshot_theme,
                 include_tweet_link=self.settings.include_tweet_link,
             )

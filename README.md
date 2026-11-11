@@ -114,6 +114,7 @@
 | `twitter_poll_max_tweets_per_user` | `5` | 每位推主每轮最多推送的条数 |
 | `twitter_text_render_mode` | `text` | `text` 文字，或 `screenshot` 截图 |
 | `twitter_translate_enabled` | `false` | 是否翻译推文正文 |
+| `twitter_translate_show_source` | `false` | 是否在消息里标注翻译服务、提供商或模型 |
 
 <details>
 <summary>展开查看全部配置项</summary>
@@ -154,6 +155,7 @@
 | `twitter_link_recognition_enabled` | `auto` | `auto` 自动解析、`command` 仅指令解析、`off` 关闭 |
 | `twitter_agent_query_enabled` | `false` | 允许 Agent 调用 `twitter_recent_pushes` 查询本会话推送摘要 |
 | `twitter_translate_enabled` | `false` | 自动翻译推文正文 |
+| `twitter_translate_show_source` | `false` | 在普通消息、合并转发和截图中标注翻译来源；默认关闭，译文仍会发送 |
 | `twitter_translate_method` | `llm` | `x` 使用 X 自带翻译，`llm` 使用 LLM 翻译；旧配置默认使用 LLM |
 | `twitter_translate_native_lang` | `zh` | X 翻译目标语言代码，如 `zh`、`ja`、`en`；仅选择 X 翻译时显示 |
 | `twitter_translate_target_lang` | `简体中文` | LLM 翻译目标语言；仅选择 LLM 翻译时显示 |
