@@ -25,6 +25,7 @@ from .services import (
     TweetMessageSettings,
 )
 from .services.avatar_cache_service import AvatarCacheService
+from .services.platform_support import is_telegram_event, meta_value, platform_instances
 from .twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
@@ -269,6 +270,10 @@ class TwitterPlugin(Star):
                 )
             ),
         )
+        self.telegram_video_max_size_mb = max(
+            1,
+            int(self._cfg("message_format", "twitter_telegram_video_max_size_mb", 50)),
+        )
         self.collective_max_authors = max(
             1,
             int(
@@ -415,6 +420,7 @@ class TwitterPlugin(Star):
                 collective_forward=self.collective_forward,
                 collective_max_authors=self.collective_max_authors,
                 deduplicate_retweets=self.deduplicate_retweets,
+                telegram_video_max_size_mb=self.telegram_video_max_size_mb,
             ),
         )
         self.polling_service = PollingService(
@@ -466,6 +472,8 @@ class TwitterPlugin(Star):
         """初始化数据源并启动轮询任务。"""
         logger.info("Twitter 推文转发插件初始化中...")
 
+        await self._migrate_group_subscriptions()
+
         if self.collective_forward and not self.use_node:
             logger.warning(
                 "集体转发模式已开启但合并转发消息未开启，集体转发功能不会生效。"
@@ -507,6 +515,11 @@ class TwitterPlugin(Star):
 
         logger.info("Twitter 推文转发插件初始化完成")
 
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """冷启动时插件先于平台初始化，平台就绪后补做旧群订阅迁移。"""
+        await self._migrate_group_subscriptions()
+
     async def terminate(self):
         """停止后台任务，发送剩余缓存并关闭 HTTP 客户端。"""
         self._running = False
@@ -530,6 +543,23 @@ class TwitterPlugin(Star):
         logger.info("Twitter 推文转发插件已停止")
 
     # WebUI 与现有调用方使用的兼容委托。
+    async def _migrate_group_subscriptions(self) -> bool:
+        """平台实例可用后迁移旧 QQ 订阅；未就绪时由后续轮询重试。"""
+        instances = platform_instances(self.context)
+        if not instances:
+            return False
+        platform_ids = {
+            platform_id
+            for platform in instances
+            if meta_value(platform.meta(), "name") == "aiocqhttp"
+            for platform_id in [meta_value(platform.meta(), "id")]
+            if platform_id
+        }
+        count = await self.subscription_service.migrate_qq_group_sessions(platform_ids)
+        if count:
+            logger.info(f"已将 {count} 个 QQ 成员会话订阅归并到真实群聊")
+        return True
+
     async def _get_subs(self) -> dict:
         return await self.subscription_service.get_all()
 
@@ -593,6 +623,9 @@ class TwitterPlugin(Star):
         PollingService.attach_timeline_item_metadata(tweet_info, item)
 
     async def _check_all_subscriptions(self) -> None:
+        # 不在平台尚未初始化或迁移失败时读取旧会话快照并发送推文。
+        if not await self._migrate_group_subscriptions():
+            return
         await self.polling_service.check_all()
 
     async def _check_user_tweets(self, username: str, info: dict) -> bool:
@@ -645,7 +678,9 @@ class TwitterPlugin(Star):
                     self._poll_wakeup.wait(),
                     timeout=self.poll_interval * 60,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
+                # Python 3.10 的 asyncio.TimeoutError 不是内置 TimeoutError，
+                # 必须显式捕获，否则轮询任务会在第一次等待超时后退出。
                 return
 
     async def _poll_tweets(self) -> None:
@@ -701,7 +736,7 @@ class TwitterPlugin(Star):
 
         try:
             add_result = await self._add_subscription(
-                event.unified_msg_origin,
+                SubscriptionService.session_target(event),
                 username,
                 r18=r18,
                 media_only=media_only,
@@ -767,7 +802,7 @@ class TwitterPlugin(Star):
             f"正在批量订阅 {len(usernames)} 个推主，请稍候..."
         )
 
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         results: list[str] = []
         success_count = 0
         for username in usernames:
@@ -821,7 +856,7 @@ class TwitterPlugin(Star):
 
         username = username.strip("@").strip()
         remove_result = await self._remove_subscription(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             username,
         )
         if not remove_result["ok"]:
@@ -841,7 +876,7 @@ class TwitterPlugin(Star):
             return
 
         usernames = [token.strip("@").strip() for token in tokens]
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         results: list[str] = []
         success_count = 0
         for username in usernames:
@@ -900,7 +935,7 @@ class TwitterPlugin(Star):
     @filter.command("推特列表", alias={"twitter_list"})
     async def list_follows(self, event: AstrMessageEvent):
         """以分段合并转发查看当前会话的完整订阅列表。"""
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         subs = await self._get_subs()
         lines = []
         for username, info in subs.items():
@@ -923,9 +958,15 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
+        chunks = self._subscription_list_chunks(lines)
+        if is_telegram_event(event):
+            for text in chunks:
+                yield event.plain_result(text)
+            return
+
         nodes = [
             Node(content=[Plain(text)], name="推特订阅列表", uin=event.get_self_id())
-            for text in self._subscription_list_chunks(lines)
+            for text in chunks
         ]
         yield event.chain_result([Nodes(nodes)])
 
@@ -942,7 +983,7 @@ class TwitterPlugin(Star):
 
         enabled = action == "开启"
         count = await self._set_session_subscriptions_status(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             enabled,
         )
         if count > 0:
@@ -1022,6 +1063,7 @@ class TwitterPlugin(Star):
             tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
+            video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
         )
         if not chain:
             yield event.plain_result(f"未找到 @{username} 的推文内容")
@@ -1039,9 +1081,16 @@ class TwitterPlugin(Star):
             prepared = self.delivery_service.prepare_event_delivery(
                 chain,
                 nickname,
+                **({"use_node": False} if is_telegram_event(event) else {}),
             )
             if prepared.primary_chain:
-                yield event.chain_result(prepared.primary_chain)
+                if is_telegram_event(event):
+                    if not await self.delivery_service.send_telegram_tweet(
+                        umo, prepared.primary_chain, username, tweet_info,
+                    ):
+                        yield event.plain_result("推文主要内容发送失败，请稍后重试")
+                else:
+                    yield event.chain_result(prepared.primary_chain)
             else:
                 yield event.plain_result(f"未找到 @{username} 的推文内容")
             await self.delivery_service.send_prepared_videos(
@@ -1083,6 +1132,7 @@ class TwitterPlugin(Star):
                 {"r18": True, "media": False, "status": True},
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
             )
             if not chain:
                 if report_errors:
@@ -1100,9 +1150,16 @@ class TwitterPlugin(Star):
             prepared = self.delivery_service.prepare_event_delivery(
                 chain,
                 nickname,
+                **({"use_node": False} if is_telegram_event(event) else {}),
             )
             if prepared.primary_chain:
-                yield event.chain_result(prepared.primary_chain)
+                if is_telegram_event(event):
+                    if not await self.delivery_service.send_telegram_tweet(
+                        umo, prepared.primary_chain, username, tweet_info,
+                    ) and report_errors:
+                        yield event.plain_result("推文主要内容发送失败，请稍后重试")
+                else:
+                    yield event.chain_result(prepared.primary_chain)
             elif report_errors and not prepared.videos:
                 yield event.plain_result("未找到可发送的推文内容")
             await self.delivery_service.send_prepared_videos(
@@ -1165,7 +1222,7 @@ class TwitterPlugin(Star):
             capped = 5
         filter_name = str(username or "").strip().lstrip("@") or None
         items = await self.subscription_service.list_session_recent_deliveries(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             username=filter_name,
             limit=capped,
         )
