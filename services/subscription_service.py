@@ -7,9 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from astrbot.api import logger
+
+from ..twitter_diagnostics import anchor, reference
+
 
 KV_SUBS_KEY = "twitter_subs"
 KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
+KV_TELEGRAM_GROUPS_KEY = "twitter_telegram_groups"
 RETWEET_DEDUP_MAX_ITEMS = 500
 PROCESSED_TWEET_MAX_ITEMS = 500
 PENDING_TWEET_MAX_ITEMS = 500
@@ -79,6 +84,132 @@ class SubscriptionService:
         async with self._lock:
             return copy.deepcopy(await self.get_all())
 
+    async def get_telegram_groups(self) -> dict:
+        """独立保存手动添加的群，即使还没有推主订阅也能在列表中显示。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            return copy.deepcopy(data) if isinstance(data, dict) else {}
+
+    async def register_telegram_group(self, platform_id: str, group: dict) -> bool:
+        """保存已验证的群信息，返回是否首次添加；不更改订阅或轮询游标。"""
+        umo = f"{platform_id}:GroupMessage:{group['group_id']}"
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            groups = copy.deepcopy(data) if isinstance(data, dict) else {}
+            created = umo not in groups
+            groups[umo] = {
+                "group_id": group["group_id"], "group_name": group["group_name"],
+            }
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return created
+
+    async def remove_telegram_group(self, umo: str) -> dict:
+        """仅移除没有订阅的手动群记录，与订阅增删共享锁以防并发误删。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            if not isinstance(data, dict) or umo not in data:
+                return {"ok": False, "reason": "not_found"}
+            subs = await self.get_all()
+            if any(
+                isinstance(author, dict) and umo in author.get("subscribers", {})
+                for author in subs.values()
+            ):
+                return {"ok": False, "reason": "has_subscriptions"}
+            groups = copy.deepcopy(data)
+            del groups[umo]
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return {"ok": True}
+
+    @staticmethod
+    def session_target(event: Any) -> str:
+        """QQ 群订阅使用真实群号，不随成员隔离上下文变化。"""
+        umo = event.unified_msg_origin
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or parts[1] != "GroupMessage":
+            return umo
+        if event.get_platform_name() != "aiocqhttp":
+            return umo
+        group_id = event.get_group_id()
+        return f"{parts[0]}:GroupMessage:{group_id}" if group_id else umo
+
+    @staticmethod
+    def _qq_group_target(umo: str, platform_ids: set[str]) -> str:
+        """仅迁移已确认的 QQ 平台的「成员号_群号」，不猜测其他渠道格式。"""
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or parts[0] not in platform_ids or parts[1] != "GroupMessage":
+            return umo
+        member_id, separator, group_id = parts[2].partition("_")
+        if separator and member_id.isdecimal() and group_id.isdecimal():
+            return f"{parts[0]}:GroupMessage:{group_id}"
+        return umo
+
+    @classmethod
+    def _merge_group_subscriber(cls, target: dict, source: dict) -> None:
+        """保留目标配置，合并真实回执、跳过确认和最近历史。"""
+        for field in ("pending_delivery_ids", "pending_skip_ids"):
+            existing = target.get(field, [])
+            incoming = source.get(field, [])
+            if isinstance(incoming, list) and incoming:
+                target[field] = list(dict.fromkeys(
+                    str(item) for item in [
+                        *(existing if isinstance(existing, list) else []), *incoming,
+                    ]
+                ))
+        records = [
+            item for config in (target, source)
+            for item in (config.get("recent_deliveries") or [])
+            if isinstance(item, dict)
+        ]
+        if records:
+            records.sort(key=cls._delivery_sort_key, reverse=True)
+            history = {}
+            for record in records:
+                history.setdefault(str(record.get("tweet_id") or ""), record)
+            target["recent_deliveries"] = list(history.values())[:RECENT_DELIVERY_MAX_ITEMS]
+
+    async def migrate_qq_group_sessions(self, platform_ids: set[str]) -> int:
+        """将旧 QQ 成员会话归并到真实群，保持游标与重试窗口不变。"""
+        if not platform_ids:
+            return 0
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            migrated = 0
+            for author in subs.values():
+                subscribers = author.get("subscribers", {})
+                # 已有群配置优先；否则按旧 UMO 排序，确定性选择首个成员配置。
+                for umo in sorted(subscribers):
+                    target_umo = self._qq_group_target(umo, platform_ids)
+                    if target_umo == umo:
+                        continue
+                    source = subscribers.pop(umo)
+                    if target_umo in subscribers:
+                        self._merge_group_subscriber(subscribers[target_umo], source)
+                    else:
+                        subscribers[target_umo] = source
+                    migrated += 1
+
+            seen = copy.deepcopy(await self.get_retweet_seen())
+            changed = False
+            for umo, ids in list(seen.items()):
+                target_umo = self._qq_group_target(umo, platform_ids)
+                if target_umo == umo or not isinstance(ids, list):
+                    continue
+                existing = seen.get(target_umo, [])
+                merged = list(dict.fromkeys(
+                    str(item) for item in reversed([
+                        *ids, *(existing if isinstance(existing, list) else []),
+                    ])
+                ))[::-1][-RETWEET_DEDUP_MAX_ITEMS:]
+                if existing != merged:
+                    seen[target_umo] = merged
+                    changed = True
+            # 两个 KV 键不能原子写入：先补群级去重，保留旧键以便中断后重试。
+            if changed:
+                await self.save_retweet_seen(seen)
+            if migrated:
+                await self.save_all(subs)
+            return migrated
+
     @staticmethod
     def find_key(subs: dict, username: str) -> str | None:
         """按不区分大小写的用户名查找现有推主键。"""
@@ -129,6 +260,7 @@ class SubscriptionService:
                         session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
+                self._log_subscription_cursor(umo, existing_key, author, source="existing")
                 return {
                     "ok": True,
                     "username": existing_key,
@@ -149,6 +281,10 @@ class SubscriptionService:
 
         latest_ids = await self.twitter_api.get_user_newtimeline(username)
         since_id = str(latest_ids[-1]) if latest_ids else ""
+        logger.info("首次订阅游标候选: " + anchor(
+            "subscription.cursor.selected", author=username, target=reference(umo),
+            since=since_id, returned_ids=len(latest_ids), strategy="initial_batch_max_id",
+        ))
         screen_name = str(user_info.get("screen_name") or username)
 
         # 网络请求期间可能已有另一个入口添加了同一推主，保存前再次检查。
@@ -176,6 +312,7 @@ class SubscriptionService:
                         session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
+                self._log_subscription_cursor(umo, existing_key, author, source="concurrent_existing")
                 return {
                     "ok": True,
                     "username": existing_key,
@@ -194,6 +331,7 @@ class SubscriptionService:
                 "subscribers": {umo: session_config},
             }
             await self.save_all(subs)
+            self._log_subscription_cursor(umo, username, subs[username], source="new")
 
         return {
             "ok": True,
@@ -203,6 +341,18 @@ class SubscriptionService:
             "created_author": True,
             "replaced": False,
         }
+
+    @staticmethod
+    def _log_subscription_cursor(umo: str, username: str, author: dict, *, source: str) -> None:
+        """只在成功持久化后记录最终游标，区分网络请求期间创建的并发订阅。"""
+        subscriber = author.get("subscribers", {}).get(umo, {})
+        logger.info("订阅已保存: " + anchor(
+            "subscription.cursor.saved", author=username, target=reference(umo), source=source,
+            since=str(author.get("since_id") or ""),
+            subscribers=len(author.get("subscribers", {})),
+            enabled=bool(subscriber.get("status", True)),
+            r18=bool(subscriber.get("r18", False)), media_only=bool(subscriber.get("media", False)),
+        ))
 
     async def update(self, umo: str, username: str, changes: dict) -> dict:
         """修改单个会话中的订阅选项。"""
@@ -487,6 +637,7 @@ class SubscriptionService:
             if isinstance(item, dict) and str(item.get("tweet_id") or "").isdigit()
         ])
 
+
     async def record_delivery(self, umo: str, username: str, tweet_info: dict) -> None:
         """直接调用时持久化有界摘要，不更改轮询游标。"""
         delivery = self.prepare_delivery(umo, username, tweet_info)
@@ -514,6 +665,24 @@ class SubscriptionService:
                 "username": key,
                 "author_removed": author_removed,
             }
+
+    async def clear_session(self, umo: str) -> dict:
+        """一次写入清空指定会话；保留其他会话的配置、游标和重试状态。"""
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            relations = authors = 0
+            for username, author in list(subs.items()):
+                subscribers = author.get("subscribers", {})
+                if umo not in subscribers:
+                    continue
+                subscribers.pop(umo)
+                relations += 1
+                if not subscribers:
+                    subs.pop(username)
+                    authors += 1
+            if relations:
+                await self.save_all(subs)
+            return {"authors": authors, "relations": relations}
 
     async def set_session_status(self, umo: str, enabled: bool) -> int:
         """统一修改一个会话中的全部推送状态。"""
